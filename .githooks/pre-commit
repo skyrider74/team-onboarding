@@ -1,0 +1,128 @@
+#!/bin/sh
+#
+# pre-commit - 커밋 '내용'에 들어간 비밀정보 / 개인정보 차단
+#
+# .gitignore는 파일 '이름'만 봅니다. 온보딩 문서의 최대 위험은
+# README.md 본문에 적힌 공용계정 비밀번호 / VPN 정보 / 주민등록번호이며,
+# 그것은 .gitignore로 절대 막을 수 없습니다. 이 훅이 그 구멍을 막습니다.
+#
+# 설치:  git config core.hooksPath .githooks
+# 확인:  git config --get core.hooksPath   ->  .githooks
+#
+# 한계: --no-verify 로 우회 가능합니다. 최종 방어선은 서버측
+#       GitHub Secret Scanning + Push Protection 입니다.
+
+set -u
+
+RED=''
+YEL=''
+GRN=''
+RST=''
+if [ -t 2 ]; then
+    RED=$(printf '\033[31m'); YEL=$(printf '\033[33m')
+    GRN=$(printf '\033[32m'); RST=$(printf '\033[0m')
+fi
+
+FAIL=0
+MAX_BYTES=2097152   # 2MB. 문서 저장소에서 이보다 큰 파일은 대개 데이터 내보내기(export)입니다.
+
+# 스캔 제외: 패턴 정의 파일 자체 (자기 자신에 걸리는 것 방지)
+is_excluded() {
+    case "$1" in
+        .gitignore|.gitattributes|.gitleaks.toml) return 0 ;;
+        .githooks/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+report() {
+    # $1=파일 $2=항목명 $3=매칭라인
+    printf '%s  [차단]%s %s\n' "$RED" "$RST" "$1"
+    printf '         항목: %s\n' "$2"
+    printf '         내용: %s\n' "$3"
+    FAIL=1
+}
+
+# ---------------------------------------------------------------------------
+# 검사할 스테이징 파일 목록 (추가/복사/수정된 것만)
+# ---------------------------------------------------------------------------
+FILES=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$FILES" ] && exit 0
+
+printf '%s[보안검사]%s 커밋 내용 스캔 중...\n' "$GRN" "$RST"
+
+for f in $FILES; do
+    is_excluded "$f" && continue
+
+    # --- 1) .gitignore를 우회해 강제 추가(git add -f)된 파일 탐지 ---
+    if git check-ignore -q "$f" 2>/dev/null; then
+        printf '%s  [차단]%s %s\n' "$RED" "$RST" "$f"
+        printf '         .gitignore가 차단한 파일을 강제 추가(-f)했습니다.\n'
+        printf '         정말 필요하면 .gitignore의 LAYER 2에 허용규칙을 추가하세요.\n'
+        FAIL=1
+        continue
+    fi
+
+    # --- 2) 과도한 파일 크기 (데이터 내보내기 의심) ---
+    BLOB=$(git ls-files -s "$f" 2>/dev/null | awk '{print $2}')
+    if [ -n "$BLOB" ]; then
+        SIZE=$(git cat-file -s "$BLOB" 2>/dev/null || echo 0)
+        if [ "$SIZE" -gt "$MAX_BYTES" ]; then
+            printf '%s  [차단]%s %s\n' "$RED" "$RST" "$f"
+            printf '         크기 %s bytes (제한 %s). 데이터 내보내기 파일이 아닌지 확인하세요.\n' "$SIZE" "$MAX_BYTES"
+            FAIL=1
+            continue
+        fi
+    fi
+
+    # 바이너리는 내용 스캔 생략
+    if git diff --cached --numstat -- "$f" | grep -q '^-	-	'; then
+        continue
+    fi
+
+    CONTENT=$(git show ":$f" 2>/dev/null) || continue
+
+    # --- 3) 자격증명 / 토큰 패턴 ---
+    scan() {
+        HIT=$(printf '%s' "$CONTENT" | grep -nE "$2" | head -2)
+        [ -n "$HIT" ] && report "$f" "$1" "$(printf '%s' "$HIT" | head -1 | cut -c1-110)"
+    }
+
+    scan "개인키 블록"         'BEGIN[ A-Z]*PRIVATE KEY'
+    scan "AWS 액세스키"        '(AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}'
+    scan "AWS 시크릿키"        'aws_?secret_?access_?key[[:space:]]*[:=]'
+    scan "GitHub 토큰"         'gh[pousr]_[A-Za-z0-9]{30,}'
+    scan "Slack 토큰"          'xox[baprse]-[0-9A-Za-z-]{10,}'
+    scan "Google API 키"       'AIza[0-9A-Za-z_-]{35}'
+    scan "Anthropic/OpenAI 키" 'sk-(ant-)?[A-Za-z0-9_-]{20,}'
+    scan "JWT 토큰"            'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}'
+    scan "Bearer 토큰"         '[Bb]earer[[:space:]]+[A-Za-z0-9._-]{20,}'
+    scan "DB 접속문자열"       '(mysql|postgres|postgresql|mongodb|mongodb\+srv|redis|amqp|ftp|sftp)://[^:/[:space:]]+:[^@[:space:]]+@'
+    scan "Private 키 할당"     '(private_?key|secret_?key|client_?secret)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,}'
+
+    # --- 4) 비밀번호 평문 기재 (한글 문서 특화) ---
+    scan "비밀번호 평문"       '([Pp]assword|[Pp]asswd|[Pp]wd|비밀번호|패스워드|암호)[[:space:]]*[:=][[:space:]]*[^[:space:]]{4,}'
+    scan "계정/비번 병기"      '(아이디|ID|계정)[[:space:]]*/[[:space:]]*(비밀번호|[Pp]assword|[Pp][Ww])'
+
+    # --- 5) 개인정보 (한국) ---
+    scan "주민등록번호"        '[0-9]{6}[[:space:]]*-[[:space:]]*[1-8][0-9]{6}'
+    scan "휴대전화번호"        '01[016789][-. ]?[0-9]{3,4}[-. ]?[0-9]{4}'
+    scan "카드/계좌번호"       '[0-9]{4}[- ][0-9]{4}[- ][0-9]{4}[- ][0-9]{4}'
+    scan "여권번호"            '\b[MSRODmsrod][0-9]{8}\b'
+done
+
+if [ "$FAIL" -ne 0 ]; then
+    printf '\n%s===========================================================%s\n' "$RED" "$RST"
+    printf '%s커밋이 차단되었습니다.%s\n' "$RED" "$RST"
+    printf '%s===========================================================%s\n' "$RED" "$RST"
+    printf '조치 방법:\n'
+    printf '  1. 해당 값을 문서에서 삭제하고, 사내 비밀관리 시스템 링크로 대체하세요.\n'
+    printf '  2. 이미 외부에 노출된 자격증명이면 %s즉시 폐기/재발급%s 하세요.\n' "$YEL" "$RST"
+    printf '     (git에서 지워도 히스토리/캐시에 남습니다)\n'
+    printf '  3. 오탐이라면: git commit --no-verify\n'
+    printf '     %s단, 우회 사유를 팀에 공유하세요.%s\n\n' "$YEL" "$RST"
+    exit 1
+fi
+
+printf '%s[보안검사]%s 통과\n' "$GRN" "$RST"
+exit 0
